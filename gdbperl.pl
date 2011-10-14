@@ -15,7 +15,7 @@
 #   Redistributions in binary form must reproduce the above copyright notice,
 #     this list of conditions and the following disclaimer in the
 #     documentation and/or other materials provided with the distribution.
-#   Neither the name of the <ORGANIZATION> nor the names of its contributors
+#   Neither the name of the author nor the names of its contributors
 #      may be used to endorse or promote products derived from this software
 #      without specific prior written permission.
 #
@@ -30,21 +30,29 @@
 # CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
+# 
+# Usage: gdbperl.pl PROCESS_ID [PERL_EXECUTABLE] [OPTION=VALUE [...]]
+#        gdbperl.pl CORE_FILE PERL_EXECUTABLE [OPTION=VALUE [...]]
 
 use strict;
 use warnings;
 use IPC::Open2;
 
-my $core_or_pid = get_config(0)
-  or die "Usage: $0 PROCESS_ID [PERL_EXECUTABLE]";
+my $core_or_pid = get_config(0);
 my $exe = get_config(1, undef);
-my $is_pid = ($core_or_pid =~ /^\d+$/);
 my $gdb_rh;
 my $gdb_wh;
 my $thread_prefix = '';
 my $my_perl_prefix = '';
 my $perl_version = 0;
 
+if (!$core_or_pid) {
+  my $mess =
+    "Usage: $0 PROCESS_ID [PERL_EXECUTABLE] [OPTION=VALUE [...]]\n" .
+    "Usage: $0 CORE_FILE PERL_EXECUTABLE [OPTION=VALUE [...]]\n";
+  die "$mess";
+}
+my $is_pid = ($core_or_pid =~ /^\d+$/);
 if ($is_pid && !defined($exe)) {
   $exe = readlink("/proc/$core_or_pid/exe") # linux
 }
@@ -67,7 +75,7 @@ sub trace_one {
   };
   my $err = $@;
   if ($is_pid) {
-    system("kill -CONT $core_or_pid");
+    system("kill -CONT $core_or_pid 2>/dev/null");
   }
   close($gdb_rh);
   close($gdb_wh);
