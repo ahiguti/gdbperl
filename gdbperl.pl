@@ -39,12 +39,17 @@ use warnings;
 use IPC::Open2;
 
 my $core_or_pid = get_config(0);
+my $array_limit = get_config("array_limit", 100);
+my $hash_limit = get_config("hash_limit", 100);
+my $data_limit = get_config("data_limit", 10);
+my $show_stash = get_config("show_stash", undef);
 my $exe = get_config(1, undef);
 my $gdb_rh;
 my $gdb_wh;
 my $thread_prefix = '';
 my $my_perl_prefix = '';
 my $perl_version = 0;
+my %value_map = ();
 
 if (!$core_or_pid) {
   my $mess =
@@ -121,10 +126,20 @@ sub cmd_get_value {
   my $resp = cmd_exec($cmd);
   return '' if ($resp !~ / =\s+(.+)/);
   my $v = $1;
-  if ($resp =~ /0x\w+\s+\"(.+)\"/) {
+  if ($resp =~ /0x\w+\s+\"(.*)\"/) {
     return $1;
   }
   return $v;
+}
+
+sub shorten_expr {
+  my $expr = $_[0];
+  return $expr if ($expr =~ /\$\d+$/);
+  my $resp = cmd_exec("p $expr\n");
+  if ($resp =~ /(\$\d+)/) {
+    return "$1";
+  }
+  return $expr;
 }
 
 sub show_environ {
@@ -141,7 +156,7 @@ sub show_environ {
 }
 
 sub get_hvname {
-  my $hvstr = $_[0];
+  my $hvstr = shorten_expr($_[0]);
   if ($perl_version <= 8) {
     return cmd_get_value("p $hvstr->sv_any->xhv_name\n");
   }
@@ -160,7 +175,7 @@ sub get_hvname {
 }
 
 sub get_perl_cop {
-  my $base = $_[0];
+  my $base = shorten_expr($_[0]);
   my $cop_file;
   if ($thread_prefix eq '') {
     if ($perl_version >= 10) {
@@ -186,54 +201,257 @@ sub get_perl_cop {
   return "$file:$line";
 }
 
-sub get_perl_value {
-  my ($estr) = @_;
-  my $svt = cmd_get_value("p $estr.sv_flags\n");
+sub sv_is_undef {
+  my $estr = $_[0];
+  my $svt = cmd_get_value("p $estr->sv_flags\n");
   if (!defined($svt) || $svt !~ /^\d+$/) {
-    return '?';
+    return 1;
+  }
+  my $typ = $svt & 0xff;
+  return ($typ == 0);
+}
+
+sub get_ptr {
+  my $str = $_[0];
+  if ($str =~ /\(\w+ \*\)\s+(.+)/) {
+    return $1;
+  }
+  return $str;
+}
+
+sub get_perlsv {
+  my ($estr, $digkey, $depth) = @_;
+  if (is_empty_key($digkey)) {
+    return '-' if (++$depth >= $data_limit);
+  }
+  $estr = shorten_expr($estr);
+  my $value_ptr = get_ptr(cmd_get_value("p $estr\n"));
+  if (defined $value_map{$value_ptr}) {
+    return $value_ptr;
+  }
+  # print STDERR "$estr PTR = $value_ptr\n";
+  my $svt = cmd_get_value("p $estr->sv_flags\n");
+  if (!defined($svt) || $svt !~ /^\d+$/) {
+    return '??';
   }
   my $typ = $svt & 0xff;
   return 'undef' if $typ == 0;
+  my $rv = '';
+  my $reuse_flag = 0;
   if ($perl_version >= 12) {
     return 'ref' if ($svt & 0x0800) != 0 && $typ == 2;
-    return cmd_get_value("p ((XPVIV*)$estr.sv_any)->xiv_u.xivu_iv\n")
+    return cmd_get_value("p ((XPVIV*)$estr->sv_any)->xiv_u.xivu_iv\n")
       if $typ == 2;
-    return cmd_get_value("p ((XPVNV*)$estr.sv_any)->xnv_u.xnv_nv\n")
+    return cmd_get_value("p ((XPVNV*)$estr->sv_any)->xnv_u.xnv_nv\n")
       if $typ == 3;
-    return '"' . cmd_get_value("p $estr.sv_u.svu_pv\n") . '"' if $typ >= 4;
+    return '"' . cmd_get_value("p $estr->sv_u.svu_pv\n") . '"' if $typ >= 4;
+    $rv = '?';
   } elsif ($perl_version >= 10) {
-    return cmd_get_value("p ((XPVIV*)$estr.sv_any)->xiv_u.xivu_iv\n")
+    return cmd_get_value("p ((XPVIV*)$estr->sv_any)->xiv_u.xivu_iv\n")
       if $typ == 2;
-    return cmd_get_value("p ((XPVNV*)$estr.sv_any)->xnv_u.xnv_nv\n")
+    return cmd_get_value("p ((XPVNV*)$estr->sv_any)->xnv_u.xnv_nv\n")
       if $typ == 3;
     return 'ref' if $typ == 4;
-    return '"' . cmd_get_value("p $estr.sv_u.svu_pv\n") . '"' if $typ >= 5;
+    return '"' . cmd_get_value("p $estr->sv_u.svu_pv\n") . '"' if $typ >= 5;
+    $rv = '?';
   } else {
-    return cmd_get_value("p ((XPVIV*)$estr.sv_any)->xiv_iv\n") if $typ == 1;
-    return cmd_get_value("p ((XPVNV*)$estr.sv_any)->xnv_nv\n") if $typ == 2;
-    return 'ref' if $typ == 3;
-    return '"' . cmd_get_value("p ((XPV*)$estr.sv_any)->xpv_pv\n") . '"'
-      if $typ >= 4;
+    my $objstr = '';
+    if (($svt & 0x1000) != 0) {
+      $objstr = get_hvname("((XPVMG*)$estr->sv_any)->xmg_stash")
+    }
+    if ($typ >= 13) {
+      $rv .= get_perlgv($estr, $digkey, $depth);
+      $reuse_flag = 1;
+    } elsif ($typ >= 12) {
+      $rv .= "(CV)";
+    } elsif ($typ >= 11) {
+      $rv .= get_perlhv($estr, $digkey, $depth);
+      $reuse_flag = 1;
+    } elsif ($typ >= 10) {
+      $rv .= get_perlav($estr, $digkey, $depth);
+      $reuse_flag = 1;
+    } elsif ($typ >= 4) {
+      $rv .= '"' . cmd_get_value("p ((XPV*)$estr->sv_any)->xpv_pv\n") . '"';
+    } elsif ($typ >= 3) {
+      $rv .= get_perlrv($estr, $digkey, $depth);
+    } elsif ($typ >= 2) {
+      $rv .= cmd_get_value("p ((XPVNV*)$estr->sv_any)->xnv_nv\n");
+    } elsif ($typ >= 1) {
+      $rv .= cmd_get_value("p ((XPVIV*)$estr->sv_any)->xiv_iv\n");
+    } else {
+      return 'undef';
+    }
+    if ($objstr) {
+      $rv = "(BLESS: '$objstr' $rv)";
+    }
   }
-  return '?';
+  if ($reuse_flag) {
+#    $value_map{$value_ptr} = $rv;
+#    $rv = "$value_ptr $rv";
+  }
+  return $rv;
+}
+
+sub is_empty_key {
+  my $digkey = $_[0];
+  return !$digkey || scalar(@$digkey) == 0;
+}
+
+sub get_perlrv {
+  my ($estr, $digkey, $depth) = @_;
+  # return '-' if $depth >= $data_limit;
+  my $s = '';
+  if ($perl_version >= 10) {
+    $s = get_perlsv("((XRV*)$estr->sv_any)->xrv_u.xrv_rv", $digkey, $depth);
+      # TODO: test
+  } else {
+    $s = get_perlsv("((XRV*)$estr->sv_any)->xrv_rv", $digkey, $depth);
+  }
+  # if ($s =~ /^\{/ || $s =~ /^\[/) { return $s; }
+  return is_empty_key($digkey) ? "\\$s" : $s;
+}
+
+sub get_perlhv {
+  my ($estr, $digkey, $depth) = @_;
+  # return '-' if $depth >= $data_limit;
+  # TODO: perl >= 5.10
+  my $hvarr = shorten_expr("(*(HE***)&((XPVHV*)($estr->sv_any))->xhv_array)");
+  my $hvmax = cmd_get_value("p ((XPVHV*)($estr->sv_any))->xhv_max\n");
+  my $rstr = '(';
+  my $count = 0;
+  my $hvarr_val = cmd_get_value("p $hvarr\n");
+  if ($hvarr_val =~ /\s0x0$/) {
+    return "(HV)";
+  }
+  my $truncated = 0;
+  for (my $i = 0; $i <= $hvmax; ++$i) {
+    last if $truncated;
+    my $eelem = $hvarr . '[' . $i . ']'; # 1st entry of the bucket
+    while (1) {
+      my $he = cmd_get_value("p $eelem\n");
+      last if $he =~ /\s0x0$/;
+      my $kstr = cmd_get_value("p (char *)$eelem->hent_hek->hek_key\n");
+      if ($digkey && scalar(@$digkey)) {
+	my $k = $digkey->[0];
+	if ($k eq $kstr) {
+	  shift(@$digkey);
+	  return get_perlsv("$eelem->hent_val", $digkey, $depth);
+	}
+      } else {
+	my $vstr = get_perlsv("$eelem->hent_val", $digkey, $depth);
+	if ($count >= $hash_limit) {
+	  $rstr .= ", ...";
+	  $truncated = 1;
+	  last;
+	}
+	$rstr .= ', ' if ($count != 0);
+	$rstr .= $kstr . ' => ' . $vstr;
+	++$count;
+      }
+      $eelem = shorten_expr("$eelem->hent_next"); # next entry in the bucket
+    }
+  }
+  if ($digkey && scalar(@$digkey)) {
+    my $k = $digkey->[0];
+    return "(HV: '$k' NOTFOUND)";
+  }
+  $rstr .= ')';
+  return $rstr;
+}
+
+sub get_perlav {
+  my $arr = get_perlav_as_array(@_);
+  my $rstr = '(';
+  if ($arr) {
+    for (my $i = 0; $i < scalar(@$arr); ++$i) {
+      $rstr .= ', ' if ($i != 0);
+      $rstr .= $arr->[$i];
+    }
+  }
+  $rstr .= ')';
+  return $rstr;
+}
+
+sub macro_avarray {
+  my $s = $_[0];
+  if ($perl_version >= 10) {
+    return "($s->sv_u.svu_array)";
+  } else {
+    return "((SV**)($s->sv_any)->xav_array)";
+  }
+}
+
+sub get_perlav_as_array {
+  my ($avstr, $digkey, $depth) = @_; # (SV*) or (AV*)
+  # return '-' if $depth >= $data_limit;
+  $avstr = shorten_expr("((AV*)($avstr))");
+  my $avfill = cmd_get_value("p $avstr->sv_any->xav_fill\n");
+  return '' if (!defined($avfill) || $avfill < 0);
+  my @arr = ();
+  for (my $i = 0; $i <= $avfill; ++$i) {
+    last if ($i >= $array_limit);
+    my $estr = macro_avarray($avstr) . "[$i]";
+    my $e = get_perlsv($estr, $digkey, $depth);
+    push(@arr, $e);
+  }
+  return \@arr;
+}
+
+sub get_perlgv {
+  my ($gvstr, $digkey, $depth) = @_;
+  # return '-' if $depth >= $data_limit;
+  my @rarr = ();
+  my $gpstr = shorten_expr("((XPVGV*)($gvstr)->sv_any)->xgv_gp");
+  my $gvcv = cmd_get_value("p $gpstr->gp_cv\n");
+  if ($gvcv && $gvcv !~ / 0x0$/) {
+    push(@rarr, '(CV)');
+  }
+  my $gvhv = cmd_get_value("p $gpstr->gp_hv\n");
+  if ($gvhv && $gvhv !~ / 0x0$/) {
+    push(@rarr, get_perlhv("$gpstr->gp_hv", $digkey, $depth));
+  }
+  my $gvav = cmd_get_value("p $gpstr->gp_av\n");
+  if ($gvav && $gvav !~ / 0x0$/) {
+    push(@rarr, get_perlav("$gpstr->gp_av", $digkey, $depth));
+  }
+  my $gvsv = cmd_get_value("p $gpstr->gp_sv\n");
+  if ($gvsv && $gvsv !~ / 0x0$/) {
+    if (!sv_is_undef("$gpstr->gp_sv")) {
+      push(@rarr, get_perlsv("$gpstr->gp_sv", $digkey, $depth));
+    }
+  }
+  if (is_empty_key($digkey) || scalar(@rarr) == 1) {
+    return $rarr[0] || '(GV)';
+  }
+  return "(GV: " . join(', ', grep { defined ($_) } @rarr) . ")";
 }
 
 sub get_sub_args {
-  my ($copstr) = @_;
-  my $avstr = "$copstr.cx_u.cx_blk.blk_u.blku_sub.argarray";
-  my $avfill = cmd_get_value("p $avstr->sv_any->xav_fill\n");
-  return '' if (!defined($avfill) || $avfill < 0);
-  $avfill = 100 if $avfill > 100;
+  my ($block_sub) = @_;
+  return '' if ($data_limit <= 0);
+  my $avstr = shorten_expr("$block_sub.argarray");
+  return get_perlav($avstr, undef, 0);
+}
+
+sub get_sub_locals {
+  my ($block_sub) = @_;
+  my $cur_cv = shorten_expr("$block_sub.cv");
+  my $idx = cmd_get_value("p $block_sub.olddepth\n") + 1;
+  my $padlist = shorten_expr("((XPVCV*)($cur_cv)->sv_any)->xcv_padlist");
+  my $plarr = macro_avarray($padlist);
+  my $padlistarray = shorten_expr("((PAD **)($plarr))");
+  my $namesarr = $padlistarray . "[0]";
+  my $valsarr = $padlistarray . "[$idx]";
+  my $names = get_perlav_as_array($namesarr);
+  my $vals = get_perlav_as_array($valsarr);
+  my $len = scalar(@$names);
   my $rstr = '';
-  for (my $i = 0; $i <= $avfill; ++$i) {
-    $rstr .= ', ' if ($i != 0);
-    my $estr = '';
-    if ($perl_version >= 10) {
-      $estr = "($avstr->sv_u.svu_array[$i])";
-    } else {
-      $estr = "(*((SV**)($avstr->sv_any)->xav_array)[$i])";
-    }
-    $rstr .= get_perl_value($estr);
+  for (my $i = 0; $i < $len; ++$i) {
+    my $n = $names->[$i];
+    next if ($n eq 'undef');
+    my $v = $vals->[$i];
+    $rstr .= ', ' if $rstr ne '';
+    $rstr .= "$n := $v";
   }
   return $rstr;
 }
@@ -254,9 +472,11 @@ sub get_cxtype_str {
 }
 
 sub get_perl_frame {
-  my ($i) = @_;
-  my $copstr = "${my_perl_prefix}curstackinfo->si_cxstack[$i]";
+  my ($stackexpr, $i) = @_;
+  my $copstr = $stackexpr . '[' . $i . ']';
   my $pos = get_perl_cop("$copstr.cx_u.cx_blk.blku_oldcop");
+  my $sargs = '';
+  my $locals = '';
   if (get_config('perl_func', 1)) {
     my ($typ, $ns, $func, $callee) = (-1, '', '', '(unknown)');
     if ($perl_version >= 12) {
@@ -268,28 +488,28 @@ sub get_perl_frame {
     }
     my $typstr = get_cxtype_str($typ);
     if ($typstr eq 'sub') {
-      my $gvstr = "$copstr.cx_u.cx_blk.blk_u.blku_sub.cv->sv_any"
-          . "->xcv_gv->sv_any";
+      my $block_sub = shorten_expr("$copstr.cx_u.cx_blk.blk_u.blku_sub");
+      my $gvstr = "$block_sub.cv->sv_any->xcv_gv->sv_any";
       if ($perl_version >= 10) {
-        my $hvstr = "$gvstr.xnv_u.xgv_stash";
+	my $hvstr = "$gvstr.xnv_u.xgv_stash";
 	$ns = get_hvname($hvstr);
-        $func = cmd_get_value(
-          "p (char *)$gvstr.xiv_u.xivu_namehek->hek_key\n");
+	$func = cmd_get_value(
+	  "p (char *)$gvstr.xiv_u.xivu_namehek->hek_key\n");
       } else {
-        $ns = cmd_get_value("p $gvstr->xgv_stash->sv_any->xhv_name\n");
-        $func = cmd_get_value("p $gvstr->xgv_name\n");
+	$ns = cmd_get_value("p $gvstr->xgv_stash->sv_any->xhv_name\n");
+	$func = cmd_get_value("p $gvstr->xgv_name\n");
       }
       $ns = '' if $ns eq '0x0';
       $func = '' if $func eq '0x0';
-      my $sargs = get_config('perl_args', 1) ? get_sub_args($copstr) : '';
-      $callee = ($ns || $func) ? ($ns . '::' . $func . '(' . $sargs . ')')
-             : '(unknown)';
+      $sargs = "ARGS: " . get_sub_args($block_sub);
+      $locals = "LOCALS: " . get_sub_locals($block_sub);
+      $callee = ($ns || $func) ? ($ns . '::' . $func) : '(unknown)';
     } else {
       $callee = "($typstr)";
     }
-    return "[$i] $callee <- $pos";
+    return "[$i] $pos -> $callee $sargs $locals";
   } else {
-    return "[$i] <- $pos";
+    return "[$i] $pos";
   }
 }
 
@@ -328,7 +548,7 @@ sub show_trace {
   my $show_c_trace = get_config('c_trace', 1);
   print "c_backtrace:\n" if $show_c_trace;
   for my $line (split(/\n/, $resp)) {
-    if ($line =~ /\#(\d+) .+my_perl/) {
+    if ($line =~ /\#(\d+) .+my_perl\=0x/) {
       $fr = $1;
     }
     last if ($line eq '(gdb) ');
@@ -347,11 +567,18 @@ sub show_trace {
     $depth = 1000;
   }
   print "perl_backtrace:\n";
+  my $stackexpr = shorten_expr("${my_perl_prefix}curstackinfo->si_cxstack");
   for (my $i = $depth; $i > 0; --$i) {
-    my $pfr = get_perl_frame($i);
+    my $pfr = get_perl_frame($stackexpr, $i);
     print "$pfr\n";
   }
   print "\n";
+  if ($show_stash) {
+    my @keyarr = split(/\//, $show_stash);
+    my $defstash = get_perlhv("${my_perl_prefix}defstash", \@keyarr, 0);
+    print "stash '$show_stash':\n";
+    print "$defstash\n";
+  }
   cmd_get_value("detach\n");
   cmd_get_value("quit\n");
 }
@@ -371,8 +598,8 @@ sub get_config {
       }
     }
   }
-  my $key = $_[0];
-  my $v = ($key =~ /^\d+$/) ? $confarr->[$key] : $confmap->{$key};
+  my $digkey = $_[0];
+  my $v = ($digkey =~ /^\d+$/) ? $confarr->[$digkey] : $confmap->{$digkey};
   return defined($v) ? $v : $_[1];
 }
 
