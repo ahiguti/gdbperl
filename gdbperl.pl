@@ -3,7 +3,7 @@
 # vim:sw=2:ts=8:ai
 
 # gdbperl.pl - shows the call trace of a running perl process
-# 
+#
 # Copyright (c) Akira Higuchi
 # All rights reserved.
 #
@@ -30,7 +30,7 @@
 # CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
-# 
+#
 # Usage: gdbperl.pl PROCESS_ID [PERL_EXECUTABLE] [OPTION=VALUE [...]]
 #        gdbperl.pl CORE_FILE PERL_EXECUTABLE [OPTION=VALUE [...]]
 
@@ -59,11 +59,10 @@ if (!$core_or_pid) {
 }
 my $is_pid = ($core_or_pid =~ /^\d+$/);
 if ($is_pid && !defined($exe)) {
-  $exe = readlink("/proc/$core_or_pid/exe") # linux
+  $exe = readlink("/proc/$core_or_pid/exe"); # linux
 }
 if ($is_pid && !defined($exe)) {
-  $exe = `which perl`;
-  chomp($exe);
+  $exe = $^X;
 }
 die "failed to detect perl executable" if !$exe;
 
@@ -536,7 +535,7 @@ sub check_perl_version {
     $my_perl_prefix = 'my_perl->I';
     return;
   }
-  die "unknown perl version";
+  die "unknown version of perl";
 }
 
 sub show_trace {
@@ -602,4 +601,4 @@ sub get_config {
   my $v = ($digkey =~ /^\d+$/) ? $confarr->[$digkey] : $confmap->{$digkey};
   return defined($v) ? $v : $_[1];
 }
-
+# vim: set expandtab:
